@@ -20,7 +20,6 @@ LIMIT_4S = 960
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; color: #fafafa; }
-    /* Tablo yazı tipini biraz daha okunur yapalım */
     div[data-testid="stDataFrame"] { font-family: 'Consolas', 'Courier New', monospace; font-size: 1.05rem; }
     </style>
     """, unsafe_allow_html=True)
@@ -36,27 +35,34 @@ def kesin_format(fiyat):
     if fiyat is None or fiyat == 0:
         return "0.000000 ₺"
     
-    # Çok küçük sayılar (BONK, PEPE vb) -> 8 basamak
     if fiyat < 1:
         return "{:.8f} ₺".format(fiyat)
-    # Orta küçük sayılar (10 TL altı) -> 6 basamak
     elif fiyat < 10:
         return "{:.6f} ₺".format(fiyat)
-    # Normal sayılar -> 2 basamak
     else:
         return "{:,.2f} ₺".format(fiyat)
 
-# --- VERİ ÇEKME ---
+# --- VERİ ÇEKME (BİNANCE DÜZELTİLDİ) ---
 def get_usdt_try():
+    # 1. Deneme: Alternatif Adres (Vision)
     try:
-        resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=USDTTRY", timeout=2).json()
+        url = "https://data-api.binance.vision/api/v3/ticker/price?symbol=USDTTRY"
+        resp = requests.get(url, timeout=3).json()
         return float(resp['price'])
     except:
-        return 34.50
+        # 2. Deneme: Ana Adres
+        try:
+            url = "https://api.binance.com/api/v3/ticker/price?symbol=USDTTRY"
+            resp = requests.get(url, timeout=3).json()
+            return float(resp['price'])
+        except:
+            return 34.50 # Hiçbiri çalışmazsa manuel kur
 
 def get_binance_prices(usdt_try):
+    # 1. Deneme: Alternatif Adres (Vision) - Cloud dostu adres
     try:
-        resp = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=2).json()
+        url = "https://data-api.binance.vision/api/v3/ticker/price"
+        resp = requests.get(url, timeout=3).json()
         data = {}
         for item in resp:
             if item['symbol'].endswith("USDT"):
@@ -64,11 +70,22 @@ def get_binance_prices(usdt_try):
                 data[coin] = float(item['price']) * usdt_try
         return data
     except:
-        return {}
+        # 2. Deneme: Yedek Adres
+        try:
+            url = "https://api.binance.com/api/v3/ticker/price"
+            resp = requests.get(url, timeout=3).json()
+            data = {}
+            for item in resp:
+                if item['symbol'].endswith("USDT"):
+                    coin = item['symbol'].replace("USDT", "")
+                    data[coin] = float(item['price']) * usdt_try
+            return data
+        except:
+            return {}
 
 def get_btcturk_prices():
     try:
-        resp = requests.get("https://api.btcturk.com/api/v2/ticker", timeout=2).json()
+        resp = requests.get("https://api.btcturk.com/api/v2/ticker", timeout=3).json()
         data = {}
         for item in resp['data']:
             if item['pair'].endswith("TRY"):
@@ -80,7 +97,7 @@ def get_btcturk_prices():
 
 def get_paribu_data():
     try:
-        resp = requests.get("https://www.paribu.com/ticker", timeout=2).json()
+        resp = requests.get("https://www.paribu.com/ticker", timeout=3).json()
         return resp
     except:
         return None
@@ -147,11 +164,10 @@ if paribu_raw:
 
     df = pd.DataFrame(tablo_listesi)
     
-    # 1. Önce Sıralama Yap (Sayılar bozulmadan)
+    # 1. Önce Sıralama Yap
     df = df.sort_values(by="Değişim %", ascending=False)
 
-    # 2. KRİTİK HAMLE: Sütunları zorla String (Yazı) tipine çeviriyoruz
-    # Bu işlem Streamlit'in "Sayı mı acaba?" diye tahmin yürütmesini engeller.
+    # 2. Sütunları zorla String'e çevir
     df["Fiyat (TL)"] = df["Fiyat (TL)"].astype(str)
     df["Binance (TL)"] = df["Binance (TL)"].astype(str)
     df["BtcTurk (TL)"] = df["BtcTurk (TL)"].astype(str)
@@ -166,7 +182,6 @@ if paribu_raw:
     # Sütun Ayarları
     column_config = {
         "Coin": st.column_config.TextColumn("Coin"),
-        # TextColumn kullanarak açıkça belirtiyoruz
         "Fiyat (TL)": st.column_config.TextColumn("Paribu Fiyat"),
         "Değişim %": st.column_config.NumberColumn(f"{secilen_zaman} Değişim", format="%.2f %%"),
         "Binance (TL)": st.column_config.TextColumn("Binance"),
@@ -181,7 +196,7 @@ if paribu_raw:
         hide_index=True
     )
     
-    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Tam Hassasiyet Modu")
+    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Kaynak: data-api.binance.vision")
 
 else:
     st.error("Paribu verisi alınamadı.")
