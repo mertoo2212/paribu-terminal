@@ -11,13 +11,13 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- CSS (Görünüm) ---
+# --- CSS (Görünüm İyileştirmeleri) ---
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; color: #fafafa; }
     div[data-testid="stDataFrame"] { font-family: 'Consolas', 'Courier New', monospace; font-size: 1.05rem; }
-    /* Linklerin altındaki çizgiyi kaldıralım, daha temiz dursun */
-    a { text-decoration: none; }
+    /* Linklerin altındaki varsayılan çizgiyi kaldır */
+    a { text-decoration: none !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -32,39 +32,36 @@ if 'hafiza' not in st.session_state:
 if 'son_guncelleme' not in st.session_state:
     st.session_state.son_guncelleme = time.time()
 
-# --- FORMATLAMA FONKSİYONU ---
+# --- FORMATLAMA ---
 def kesin_format(fiyat):
     if fiyat is None or fiyat == 0:
         return "-" 
     if fiyat < 1:
-        return "{:.8f}_TL".format(fiyat) # Boşluk yerine _ kullanıyoruz (Link bozulmasın diye)
+        return "{:.8f} ₺".format(fiyat)
     elif fiyat < 10:
-        return "{:.6f}_TL".format(fiyat)
+        return "{:.6f} ₺".format(fiyat)
     else:
-        return "{:,.2f}_TL".format(fiyat)
+        return "{:,.2f} ₺".format(fiyat)
 
-# --- AKILLI LİNK OLUŞTURUCU (Hileli Yöntem) ---
-def create_smart_link(url, display_price):
+# --- LİNK OLUŞTURUCULAR (Standart Yapı) ---
+def make_link(base_url, price_str):
     """
-    Bu fonksiyon URL'in sonuna fiyat bilgisini ekler.
-    Örnek Link: https://paribu.com/btc-tl?etiket=3500_TL
-    Streamlit bunu okurken sadece '3500_TL' kısmını ekrana yazar.
+    URL'in sonuna ?label=FIYAT ekleyerek Streamlit'in
+    bunu okumasını ve ekranda sadece fiyatı göstermesini sağlıyoruz.
     """
-    if display_price == "-":
-        return None # Fiyat yoksa link de yok
-    return f"{url}?etiket={display_price}"
+    if price_str == "-":
+        return None
+    # Boşlukları ve ₺ işaretini temizleyip URL dostu yapalım ama görüntüde kalsın
+    clean_price = price_str.replace(" ", "_") 
+    return f"{base_url}?label={clean_price}"
 
-# --- URL DÜZELTMELERİ (404 Hatası Çözümü) ---
-def get_paribu_url(coin):
-    # Paribu linkleri KÜÇÜK harf ister: https://www.paribu.com/markets/btc-tl
+def get_paribu_base(coin):
     return f"https://www.paribu.com/markets/{coin.lower()}-tl"
 
-def get_btcturk_url(coin):
-    # BtcTurk linkleri BÜYÜK harf ister: https://pro.btcturk.com/pro/al-sat/BTC_TRY
+def get_btcturk_base(coin):
     return f"https://pro.btcturk.com/pro/al-sat/{coin.upper()}_TRY"
 
-def get_binance_url(coin):
-    # Binance linkleri BÜYÜK harf ister
+def get_binance_base(coin):
     return f"https://www.binance.com/en-TR/trade/{coin.upper()}_USDT"
 
 # --- VERİ ÇEKME ---
@@ -122,7 +119,6 @@ def get_all_market_data(usdt_rate_binance):
     return paribu_dict, btcturk_dict, binance_dict
 
 # --- ANA PROGRAM ---
-
 st.title("💎 Kripto Borsa Terminali")
 
 # KURLAR
@@ -144,6 +140,7 @@ with col_zaman:
 # VERİ İŞLEME
 p_data, b_data, bin_data = get_all_market_data(usdt_kurlar['Binance'])
 
+# Listeyi Belirle
 if ana_borsa == "Paribu":
     hedef_coin_listesi = list(p_data.keys())
 elif ana_borsa == "BtcTurk":
@@ -189,100 +186,99 @@ for coin in hedef_coin_listesi:
         if len(gecmis) > 0 and gecmis[idx] > 0:
             gosterilecek_degisim = ((gecmis[-1] - gecmis[idx]) / gecmis[idx]) * 100
 
-    # Diğer Borsalar Fiyatları
+    # Diğer Borsalar
     p_fiyat = p_data.get(coin, {}).get('price', 0)
     bt_fiyat = b_data.get(coin, {}).get('price', 0)
     bin_fiyat = bin_data.get(coin, {}).get('price', 0)
 
-    # Fiyatları Formatla (String Haline Getir)
+    # String Formatlar
     str_ana = kesin_format(base_fiyat)
     str_p = kesin_format(p_fiyat)
     str_bt = kesin_format(bt_fiyat)
     str_bin = kesin_format(bin_fiyat)
 
-    # --- TABLO SATIRI (AKILLI LİNKLER İLE) ---
-    # Fiyat sütununa artık sadece yazı değil, LINK veriyoruz.
-    # Linkin içinde fiyat gizli parametre olarak duruyor.
-    
-    # Ana Borsa Linkini Belirle
-    ana_link = None
-    if ana_borsa == "Paribu": ana_link = get_paribu_url(coin)
-    elif ana_borsa == "BtcTurk": ana_link = get_btcturk_url(coin)
-    else: ana_link = get_binance_url(coin)
-
     tablo_satirlari.append({
         "Coin": coin,
-        # Ana Fiyat (Seçili Borsanın Fiyatı ve Linki)
-        f"{ana_borsa} Fiyat": create_smart_link(ana_link, str_ana),
-        
+        f"Ana Fiyat": str_ana, # Sadece Yazı (Link Yok)
         "Değişim %": gosterilecek_degisim,
-        
-        # Paribu Fiyatı (Tıklanabilir Link)
-        "Paribu": create_smart_link(get_paribu_url(coin), str_p),
-        
-        # BtcTurk Fiyatı (Tıklanabilir Link)
-        "BtcTurk": create_smart_link(get_btcturk_url(coin), str_bt),
-        
-        # Binance Fiyatı (Tıklanabilir Link)
-        "Binance": create_smart_link(get_binance_url(coin), str_bin)
+        "Paribu": make_link(get_paribu_base(coin), str_p),
+        "BtcTurk": make_link(get_btcturk_base(coin), str_bt),
+        "Binance": make_link(get_binance_base(coin), str_bin)
     })
 
 if tablo_satirlari:
     df = pd.DataFrame(tablo_satirlari)
     df = df.sort_values(by="Değişim %", ascending=False)
     
-    def stil_ver(val):
-        if isinstance(val, (int, float)):
-            if val > 0: return 'color: #00ff00; font-weight: bold;'
-            elif val < 0: return 'color: #ff4444; font-weight: bold;'
-        return 'color: white;'
-    
-    # --- SÜTUN AYARLARI (SİHİR BURADA) ---
-    # LinkColumn kullanıyoruz ama display_text'i URL'in içindeki "etiket=..." kısmından al diyoruz.
-    # Regex: etiket=(.*) -> Yani etiket= yazısından sonraki her şeyi göster (Fiyatı göster).
-    
+    # --- RENKLENDİRME MANTIĞI (PANDAS STYLER) ---
+    def renk_uygula(row):
+        # Varsayılan renkler
+        styles = [''] * len(row)
+        
+        degisim = row["Değişim %"]
+        
+        # 2. Sütun (Ana Fiyat) -> Değişime göre Yeşil/Kırmızı
+        if degisim > 0:
+            styles[1] = 'color: #00ff00; font-weight: bold' # Yeşil
+        elif degisim < 0:
+            styles[1] = 'color: #ff4444; font-weight: bold' # Kırmızı
+        
+        # 3. Sütun (Değişim) -> Zaten kendi renklendirmesi var ama manuel de yapabiliriz
+        if degisim > 0:
+            styles[2] = 'color: #00ff00; font-weight: bold'
+        elif degisim < 0:
+            styles[2] = 'color: #ff4444; font-weight: bold'
+
+        # 4. Sütun (Paribu) -> Koyu Yeşil
+        # Link olduğu için color bazen ezilebilir ama font-weight çalışır
+        styles[3] = 'color: #2e7d32; font-weight: bold' 
+
+        # 5. Sütun (BtcTurk) -> Koyu Mavi
+        styles[4] = 'color: #1565c0; font-weight: bold'
+
+        # 6. Sütun (Binance) -> Sarı (Okunurluk için Parlak Sarı/Gold)
+        styles[5] = 'color: #ffd700; font-weight: bold'
+        
+        return styles
+
+    # --- SÜTUN AYARLARI ---
     column_config = {
         "Coin": st.column_config.TextColumn("Coin"),
+        "Ana Fiyat": st.column_config.TextColumn(f"🔥 {ana_borsa} (Ana)"),
         "Değişim %": st.column_config.NumberColumn(f"{zaman_dilimi} Değişim", format="%.2f %%"),
         
-        f"{ana_borsa} Fiyat": st.column_config.LinkColumn(
-            f"🔥 {ana_borsa} (Ana)", 
-            display_text=r"etiket=(.*)" 
-        ),
+        # Paribu (Link ve Etiket)
         "Paribu": st.column_config.LinkColumn(
             "Paribu (TL)", 
-            display_text=r"etiket=(.*)"
+            display_text=r"label=(.*)" # URL'deki label kısmını göster
         ),
+        # BtcTurk
         "BtcTurk": st.column_config.LinkColumn(
             "BtcTurk (TL)", 
-            display_text=r"etiket=(.*)"
+            display_text=r"label=(.*)"
         ),
+        # Binance
         "Binance": st.column_config.LinkColumn(
             "Binance (TL)", 
-            display_text=r"etiket=(.*)"
+            display_text=r"label=(.*)"
         ),
     }
-
-    # Sütun Sıralaması (Sadece 6 Sütun)
-    # Ana fiyat zaten diğer sütunlardan birinin kopyası olduğu için ana fiyatı göstermeye gerek var mı?
-    # Kullanıcı "Ana borsa seçimi" yaptıysa en başta onu görmek ister.
-    # Ancak "Paribu (TL)" sütunu ile "Paribu Fiyat (Ana)" sütunu aynı olacak.
-    # Bu yüzden sadece 5 temel sütun yeterli olabilir ama senin isteğin doğrultusunda Ana Fiyatı başa koyuyorum.
     
-    sutunlar = ["Coin", f"{ana_borsa} Fiyat", "Değişim %", "Paribu", "BtcTurk", "Binance"]
+    # Sıralama
+    cols = ["Coin", "Ana Fiyat", "Değişim %", "Paribu", "BtcTurk", "Binance"]
 
     st.dataframe(
-        df[sutunlar].style.map(stil_ver, subset=["Değişim %"]),
+        df[cols].style.apply(renk_uygula, axis=1), # Renk fonksiyonunu satır satır uygula
         column_config=column_config,
         use_container_width=True,
         height=800,
         hide_index=True
     )
     
-    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Fiyatlara tıklayarak borsaya gidebilirsiniz.")
+    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | 🔗 Fiyatlara tıklayarak borsalara gidebilirsiniz.")
 
 else:
     st.error("Veri oluşturulamadı.")
 
-time.sleep(15)
+time.sleep(YENILEME_HIZI)
 st.rerun()
