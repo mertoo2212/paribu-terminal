@@ -11,6 +11,11 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- SABİTLER ---
+YENILEME_HIZI = 15  # Saniye
+LIMIT_1S = 240      # 1 Saat için gereken veri sayısı (15sn x 240 = 60dk)
+LIMIT_4S = 960      # 4 Saat için gereken veri sayısı
+
 # --- CSS ---
 st.markdown("""
     <style>
@@ -24,6 +29,12 @@ st.markdown("""
     }
     </style>
     """, unsafe_allow_html=True)
+
+# --- HAFIZA BAŞLATMA ---
+if 'hafiza' not in st.session_state:
+    st.session_state.hafiza = {}
+if 'son_guncelleme' not in st.session_state:
+    st.session_state.son_guncelleme = time.time()
 
 # --- FORMATLAMA FONKSİYONU ---
 def kesin_format(fiyat):
@@ -116,66 +127,97 @@ k3.metric("Binance USDT", f"{usdt_kurlar['Binance']:.2f} ₺")
 
 st.markdown("---")
 
-# 2. BÖLÜM: ANA BORSA SEÇİMİ
-col_secim, col_bosluk = st.columns([2, 3])
-with col_secim:
-    ana_borsa = st.radio("ANA BORSA (Tabloyu buna göre kur):", 
+# 2. BÖLÜM: FİLTRELER (YAN YANA)
+col_borsa, col_zaman = st.columns([1, 1])
+
+with col_borsa:
+    ana_borsa = st.radio("BORSA SEÇİMİ:", 
                          ["Paribu", "BtcTurk", "Binance"], 
                          horizontal=True)
 
-# 3. BÖLÜM: VERİ FİLTRELEME MANTIĞI
+with col_zaman:
+    zaman_dilimi = st.radio("ZAMAN DİLİMİ:", 
+                            ["1 Saat", "4 Saat", "24 Saat"], 
+                            horizontal=True)
+
+# 3. BÖLÜM: VERİ İŞLEME VE HAFIZA
 p_data, b_data, bin_data = get_all_market_data(usdt_kurlar['Binance'])
 
-hedef_coin_listesi = []
-kaynak_isim = ana_borsa
-
+# Hedef Listeyi Belirle
 if ana_borsa == "Paribu":
-    # Sadece Paribu'daki coinler
     hedef_coin_listesi = list(p_data.keys())
-
 elif ana_borsa == "BtcTurk":
-    # Sadece BtcTurk'teki coinler
     hedef_coin_listesi = list(b_data.keys())
-
-else: # Binance Seçildiyse
-    # MANTIK DEĞİŞİKLİĞİ: Tüm Binance'i getirme.
-    # Sadece (Paribu Listesi + BtcTurk Listesi) toplamını getir.
-    # set() kullanarak mükerrerleri engelliyoruz ve iki kümeyi birleştiriyoruz (| işareti)
+else: # Binance (Sadece TR'de olanlar)
     filtrelenmis_kume = set(p_data.keys()) | set(b_data.keys())
     hedef_coin_listesi = list(filtrelenmis_kume)
 
-# Tabloyu Doldur
 tablo_satirlari = []
 
 for coin in hedef_coin_listesi:
-    # Ana borsa verisini belirle
+    # --- FİYAT BELİRLEME ---
     base_fiyat = 0
-    base_degisim = 0.0
+    base_24h_degisim = 0.0
 
     if ana_borsa == "Paribu":
         base_fiyat = p_data.get(coin, {}).get('price', 0)
-        base_degisim = p_data.get(coin, {}).get('change', 0)
+        base_24h_degisim = p_data.get(coin, {}).get('change', 0)
     elif ana_borsa == "BtcTurk":
         base_fiyat = b_data.get(coin, {}).get('price', 0)
-        base_degisim = b_data.get(coin, {}).get('change', 0)
-    else: # Binance Modu
-        # Eğer coin Binance'de varsa onun verisini al, yoksa 0
+        base_24h_degisim = b_data.get(coin, {}).get('change', 0)
+    else: # Binance
         bin_veri = bin_data.get(coin, {})
         base_fiyat = bin_veri.get('price', 0)
-        base_degisim = bin_veri.get('change', 0)
+        base_24h_degisim = bin_veri.get('change', 0)
 
-    # Diğer borsaların fiyatları
+    # --- HAFIZA KAYDI (1S ve 4S Hesaplamak İçin) ---
+    # Eğer bu coin hafızada yoksa ekle
+    if coin not in st.session_state.hafiza:
+        st.session_state.hafiza[coin] = []
+    
+    # Şu anki fiyatı hafızaya ekle (0 değilse)
+    if base_fiyat > 0:
+        st.session_state.hafiza[coin].append(base_fiyat)
+    
+    # Hafızayı sınırlı tut (4 Saatlik veri kadar)
+    if len(st.session_state.hafiza[coin]) > LIMIT_4S + 10:
+        st.session_state.hafiza[coin].pop(0)
+
+    gecmis = st.session_state.hafiza[coin]
+
+    # --- DEĞİŞİM HESAPLAMA ---
+    gosterilecek_degisim = 0.0
+    
+    if zaman_dilimi == "24 Saat":
+        gosterilecek_degisim = base_24h_degisim
+    
+    elif zaman_dilimi == "1 Saat":
+        # 1 Saat önceki veriye git
+        idx = -LIMIT_1S if len(gecmis) >= LIMIT_1S else 0
+        if len(gecmis) > 0:
+            eski_fiyat = gecmis[idx]
+            guncel = gecmis[-1]
+            if eski_fiyat > 0:
+                gosterilecek_degisim = ((guncel - eski_fiyat) / eski_fiyat) * 100
+
+    elif zaman_dilimi == "4 Saat":
+        # 4 Saat önceki veriye git
+        idx = -LIMIT_4S if len(gecmis) >= LIMIT_4S else 0
+        if len(gecmis) > 0:
+            eski_fiyat = gecmis[idx]
+            guncel = gecmis[-1]
+            if eski_fiyat > 0:
+                gosterilecek_degisim = ((guncel - eski_fiyat) / eski_fiyat) * 100
+
+    # Diğer Borsa Fiyatları
     p_fiyat = p_data.get(coin, {}).get('price', 0)
     bt_fiyat = b_data.get(coin, {}).get('price', 0)
     bin_fiyat = bin_data.get(coin, {}).get('price', 0)
 
-    # Eğer ana borsa verisi 0 ise (örneğin Paribu+BtcTurk listesinde var ama Binance'de o coin listelenmemiş)
-    # Listeye ekleyip eklememek sana kalmış, şimdilik boş fiyatla ekliyorum ki eksik görme.
-    
     tablo_satirlari.append({
         "Coin": coin,
-        f"{kaynak_isim} Fiyat": kesin_format(base_fiyat), 
-        "24s Değişim %": base_degisim,
+        f"{ana_borsa} Fiyat": kesin_format(base_fiyat), 
+        "Değişim %": gosterilecek_degisim,
         "Paribu (TL)": kesin_format(p_fiyat),
         "BtcTurk (TL)": kesin_format(bt_fiyat),
         "Binance (TL)": kesin_format(bin_fiyat)
@@ -185,10 +227,10 @@ if tablo_satirlari:
     df = pd.DataFrame(tablo_satirlari)
     
     # Sıralama
-    df = df.sort_values(by="24s Değişim %", ascending=False)
+    df = df.sort_values(by="Değişim %", ascending=False)
     
-    # String Dönüşümü (Yuvarlama hatasını önlemek için)
-    df[f"{kaynak_isim} Fiyat"] = df[f"{kaynak_isim} Fiyat"].astype(str)
+    # String Dönüşümü
+    df[f"{ana_borsa} Fiyat"] = df[f"{ana_borsa} Fiyat"].astype(str)
     df["Paribu (TL)"] = df["Paribu (TL)"].astype(str)
     df["BtcTurk (TL)"] = df["BtcTurk (TL)"].astype(str)
     df["Binance (TL)"] = df["Binance (TL)"].astype(str)
@@ -201,19 +243,21 @@ if tablo_satirlari:
     
     column_config = {
         "Coin": st.column_config.TextColumn("Coin"),
-        "24s Değişim %": st.column_config.NumberColumn("24s Değişim", format="%.2f %%"),
-        f"{kaynak_isim} Fiyat": st.column_config.TextColumn(f"🔥 {kaynak_isim} (Ana)", help="Seçili Borsa"),
+        "Değişim %": st.column_config.NumberColumn(f"{zaman_dilimi} Değişim", format="%.2f %%"),
+        f"{ana_borsa} Fiyat": st.column_config.TextColumn(f"🔥 {ana_borsa} (Ana)", help="Seçili Borsa"),
     }
 
     st.dataframe(
-        df.style.map(stil_ver, subset=["24s Değişim %"]),
+        df.style.map(stil_ver, subset=["Değişim %"]),
         column_config=column_config,
         use_container_width=True,
         height=800,
         hide_index=True
     )
     
-    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Binance Modu Filtresi: Sadece TR Borsalarında Olanlar")
+    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Mod: {ana_borsa} - {zaman_dilimi}")
+    if zaman_dilimi != "24 Saat":
+        st.info("ℹ️ Not: 1 Saatlik ve 4 Saatlik veriler program açık kaldıkça hesaplanır. İlk açılışta %0 görünmesi normaldir.")
 
 else:
     st.error("Veri oluşturulamadı.")
