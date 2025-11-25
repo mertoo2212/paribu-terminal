@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import time
 from datetime import datetime
+import concurrent.futures # Çoklu işlem için (Hızlandırıcı)
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(
@@ -11,7 +12,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- CSS (Görünüm) ---
+# --- CSS ---
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; color: #fafafa; }
@@ -23,92 +24,110 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- SABİTLER ---
-YENILEME_HIZI = 15
-LIMIT_1S = 240
-LIMIT_4S = 960
-
-# --- HAFIZA ---
-if 'hafiza' not in st.session_state:
-    st.session_state.hafiza = {}
-if 'son_guncelleme' not in st.session_state:
-    st.session_state.son_guncelleme = time.time()
+YENILEME_HIZI = 30 # Geçmiş veriyi çekmek maliyetli olduğu için süreyi 30sn yaptık
 
 # --- FORMATLAMA ---
 def kesin_format(fiyat):
-    if fiyat is None or fiyat == 0:
-        return "-" 
-    if fiyat < 1:
-        return "{:.8f} ₺".format(fiyat)
-    elif fiyat < 10:
-        return "{:.6f} ₺".format(fiyat)
-    else:
-        return "{:,.2f} ₺".format(fiyat)
+    if fiyat is None or fiyat == 0: return "-" 
+    if fiyat < 1: return "{:.8f} ₺".format(fiyat)
+    elif fiyat < 10: return "{:.6f} ₺".format(fiyat)
+    else: return "{:,.2f} ₺".format(fiyat)
 
-# --- LİNK OLUŞTURUCULAR (Güncellenmiş Adresler) ---
+# --- LİNK OLUŞTURUCULAR ---
 def make_link(base_url, price_str):
     if price_str == "-": return None
-    # Boşlukları _ ile değiştiriyoruz ki URL bozulmasın
     clean_price = price_str.replace(" ", "_") 
     return f"{base_url}#etiket={clean_price}"
 
-def get_paribu_link(coin):
-    # DÜZELTME: -tl yerine _tl yapıldı
-    return f"https://www.paribu.com/markets/{coin.lower()}_tl"
+def get_paribu_link(coin): return f"https://www.paribu.com/markets/{coin.lower()}_tl"
+def get_btcturk_link(coin): return f"https://kripto.btcturk.com/pro/al-sat/{coin.upper()}_TRY"
+def get_binance_link(coin): return f"https://www.binance.com/en-TR/trade/{coin.upper()}_USDT"
 
-def get_btcturk_link(coin):
-    # DÜZELTME: pro.btcturk yerine kripto.btcturk yapıldı
-    return f"https://kripto.btcturk.com/pro/al-sat/{coin.upper()}_TRY"
+# --- ZAMAN YOLCULUĞU MOTORU (GEÇMİŞ VERİYİ ÇEKME) ---
+def get_historical_price(symbol, interval):
+    """
+    Binance API'sine bağlanıp geçmişteki mumu çeker.
+    interval: '1h', '4h'
+    """
+    try:
+        # data-api.binance.vision kullanarak geçmiş veriye erişiyoruz
+        # limit=2 diyerek şimdiki ve bir önceki mumu istiyoruz
+        url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit=2"
+        resp = requests.get(url, timeout=2).json()
+        
+        # resp listesi [Eski Mum, Yeni Mum] şeklindedir.
+        # Biz eski mumun "Açılış" (Open) fiyatını alıyoruz -> index 1
+        # Veri formatı: [Open Time, Open, High, Low, Close, Volume ...]
+        old_candle = resp[0]
+        open_price = float(old_candle[1]) # Mumun açılış fiyatı
+        return open_price
+    except:
+        return 0
 
-def get_binance_link(coin):
-    return f"https://www.binance.com/en-TR/trade/{coin.upper()}_USDT"
+def fetch_history_parallel(coin_list, interval):
+    """
+    Tek tek sorarsak site donar. Burada 20 işçi (worker) tutup
+    hepsini aynı anda geçmişe gönderiyoruz.
+    """
+    results = {}
+    
+    def task(coin):
+        return coin, get_historical_price(coin, interval)
 
-# --- VERİ ÇEKME ---
+    # ThreadPool ile paralel işlem
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # İşleri dağıt
+        future_to_coin = {executor.submit(task, coin): coin for coin in coin_list}
+        # İşler bittikçe sonuçları topla
+        for future in concurrent.futures.as_completed(future_to_coin):
+            coin, price = future.result()
+            results[coin] = price
+            
+    return results
+
+# --- ANLIK VERİ ÇEKME ---
 def get_usdt_rates():
     rates = {"Binance": 0, "Paribu": 0, "BtcTurk": 0}
-    try:
-        rates["Binance"] = float(requests.get("https://data-api.binance.vision/api/v3/ticker/price?symbol=USDTTRY", timeout=2).json()['price'])
+    try: rates["Binance"] = float(requests.get("https://data-api.binance.vision/api/v3/ticker/price?symbol=USDTTRY", timeout=2).json()['price'])
     except: rates["Binance"] = 34.50
-    try:
-        resp = requests.get("https://www.paribu.com/ticker", timeout=2).json()
-        rates["Paribu"] = float(resp["USDT_TL"]['last'])
+    try: 
+        r = requests.get("https://www.paribu.com/ticker", timeout=2).json()
+        rates["Paribu"] = float(r["USDT_TL"]['last'])
     except: rates["Paribu"] = 0
-    try:
-        resp = requests.get("https://api.btcturk.com/api/v2/ticker?pairSymbol=USDTTRY", timeout=2).json()
-        rates["BtcTurk"] = float(resp['data'][0]['last'])
+    try: 
+        r = requests.get("https://api.btcturk.com/api/v2/ticker?pairSymbol=USDTTRY", timeout=2).json()
+        rates["BtcTurk"] = float(r['data'][0]['last'])
     except: rates["BtcTurk"] = 0
     return rates
 
-def get_all_market_data(usdt_rate_binance):
+def get_live_data(usdt_rate):
     p_dict, bt_dict, bin_dict = {}, {}, {}
-    
     # Paribu
     try:
         r = requests.get("https://www.paribu.com/ticker", timeout=2).json()
         for s, v in r.items():
             if "_TL" in s:
-                p_dict[s.replace("_TL", "")] = {"price": float(v['last']), "change": float(v['percentChange'])}
+                p_dict[s.replace("_TL", "")] = float(v['last'])
     except: pass
-
     # BtcTurk
     try:
         r = requests.get("https://api.btcturk.com/api/v2/ticker", timeout=2).json()
         for i in r['data']:
             if i['pair'].endswith("TRY"):
-                bt_dict[i['pair'].replace("TRY", "")] = {"price": float(i['last']), "change": float(i['dailyPercent'])}
+                bt_dict[i['pair'].replace("TRY", "")] = float(i['last'])
     except: pass
-
-    # Binance
+    # Binance (Canlı + 24s Değişim)
+    bin_change = {}
     try:
         r = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=3).json()
         for i in r:
             if i['symbol'].endswith("USDT"):
-                bin_dict[i['symbol'].replace("USDT", "")] = {
-                    "price": float(i['lastPrice']) * usdt_rate_binance,
-                    "change": float(i['priceChangePercent'])
-                }
+                c = i['symbol'].replace("USDT", "")
+                bin_dict[c] = float(i['lastPrice']) * usdt_rate
+                bin_change[c] = float(i['priceChangePercent'])
     except: pass
     
-    return p_dict, bt_dict, bin_dict
+    return p_dict, bt_dict, bin_dict, bin_change
 
 # --- ANA PROGRAM ---
 st.title("💎 Kripto Borsa Terminali")
@@ -125,87 +144,99 @@ col_b, col_z = st.columns([1, 1])
 with col_b: ana_borsa = st.radio("BORSA:", ["Paribu", "BtcTurk", "Binance"], horizontal=True)
 with col_z: zaman = st.radio("ZAMAN:", ["1 Saat", "4 Saat", "24 Saat"], horizontal=True)
 
-p_d, b_d, bin_d = get_all_market_data(usdt['Binance'])
+# Canlı verileri çek
+p_prices, bt_prices, bin_prices, bin_24h_change = get_live_data(usdt['Binance'])
 
-# Liste Belirleme
-if ana_borsa == "Paribu": lst = list(p_d.keys())
-elif ana_borsa == "BtcTurk": lst = list(b_d.keys())
-else: lst = list(set(p_d.keys()) | set(b_d.keys()))
+# Listeyi Belirle
+if ana_borsa == "Paribu": lst = list(p_prices.keys())
+elif ana_borsa == "BtcTurk": lst = list(bt_prices.keys())
+else: lst = list(set(p_prices.keys()) | set(bt_prices.keys()))
 
+# --- ZAMAN MAKİNESİ MANTIĞI ---
+# 1s ve 4s seçilirse geçmiş veriyi Binance'den sorgula
+# 24s seçilirse hazır veriyi kullan
+
+trend_data = {} # Her coinin değişim oranını tutacak
+
+if zaman == "24 Saat":
+    # 24 Saat için sorguya gerek yok, API zaten veriyor
+    trend_data = bin_24h_change
+else:
+    # 1 veya 4 saat için geçmişe gitmemiz lazım
+    interval = "1h" if zaman == "1 Saat" else "4h"
+    
+    # Session State (Önbellek) kullanarak gereksiz sorguları engelle
+    # Sadece zaman dilimi değiştiğinde veya 1 dakika geçtiğinde tekrar sorgula
+    cache_key = f"history_{interval}"
+    should_refresh = False
+    
+    if cache_key not in st.session_state:
+        should_refresh = True
+    elif (time.time() - st.session_state.get(f"{cache_key}_time", 0)) > 60:
+        should_refresh = True
+    
+    if should_refresh:
+        with st.spinner(f"🚀 {zaman} önceki fiyatlar arşivden çekiliyor..."):
+            st.session_state[cache_key] = fetch_history_parallel(lst, interval)
+            st.session_state[f"{cache_key}_time"] = time.time()
+            
+    history_prices = st.session_state[cache_key]
+    
+    # Değişimleri Hesapla
+    for c in lst:
+        current_usd = bin_prices.get(c, 0) / usdt['Binance'] if usdt['Binance'] > 0 else 0
+        past_usd = history_prices.get(c, 0)
+        
+        if current_usd > 0 and past_usd > 0:
+            change = ((current_usd - past_usd) / past_usd) * 100
+            trend_data[c] = change
+        else:
+            trend_data[c] = 0.0
+
+# --- TABLOYU OLUŞTUR ---
 rows = []
 for c in lst:
-    bf, bch = 0, 0.0
-    if ana_borsa == "Paribu": bf, bch = p_d.get(c, {}).get('price', 0), p_d.get(c, {}).get('change', 0)
-    elif ana_borsa == "BtcTurk": bf, bch = b_d.get(c, {}).get('price', 0), b_d.get(c, {}).get('change', 0)
-    else: bf, bch = bin_d.get(c, {}).get('price', 0), bin_d.get(c, {}).get('change', 0)
+    # Fiyatları Hazırla
+    bf = 0
+    if ana_borsa == "Paribu": bf = p_prices.get(c, 0)
+    elif ana_borsa == "BtcTurk": bf = bt_prices.get(c, 0)
+    else: bf = bin_prices.get(c, 0)
 
-    # Hafıza
-    if c not in st.session_state.hafiza: st.session_state.hafiza[c] = []
-    if bf > 0: st.session_state.hafiza[c].append(bf)
-    if len(st.session_state.hafiza[c]) > LIMIT_4S+10: st.session_state.hafiza[c].pop(0)
-
-    mem = st.session_state.hafiza[c]
-    show_ch = 0.0
-    if zaman == "24 Saat": show_ch = bch
-    elif zaman == "1 Saat": 
-        idx = -LIMIT_1S if len(mem) >= LIMIT_1S else 0
-        if len(mem)>0 and mem[idx]>0: show_ch = ((mem[-1]-mem[idx])/mem[idx])*100
-    elif zaman == "4 Saat":
-        idx = -LIMIT_4S if len(mem) >= LIMIT_4S else 0
-        if len(mem)>0 and mem[idx]>0: show_ch = ((mem[-1]-mem[idx])/mem[idx])*100
-
-    # Diğer Borsa Fiyatları
-    pf = p_d.get(c, {}).get('price', 0)
-    btf = b_d.get(c, {}).get('price', 0)
-    binf = bin_d.get(c, {}).get('price', 0)
-
-    # String Formatlar
-    str_pf = kesin_format(pf)
-    str_btf = kesin_format(btf)
-    str_binf = kesin_format(binf)
+    pf = p_prices.get(c, 0)
+    btf = bt_prices.get(c, 0)
+    binf = bin_prices.get(c, 0)
+    
+    # Hesaplanan değişimi al
+    show_ch = trend_data.get(c, 0.0)
 
     rows.append({
         "Coin": c,
         "Ana Fiyat": kesin_format(bf),
         "Değişim %": show_ch,
-        "Paribu": make_link(get_paribu_link(c), str_pf),
-        "BtcTurk": make_link(get_btcturk_link(c), str_btf),
-        "Binance": make_link(get_binance_link(c), str_binf)
+        "Paribu": make_link(get_paribu_link(c), kesin_format(pf)),
+        "BtcTurk": make_link(get_btcturk_link(c), kesin_format(btf)),
+        "Binance": make_link(get_binance_link(c), kesin_format(binf))
     })
 
 if rows:
     df = pd.DataFrame(rows).sort_values(by="Değişim %", ascending=False)
     
-    # --- RENKLENDİRME ---
     def style_row(row):
         styles = [''] * len(row)
         ch = row["Değişim %"]
         
-        # 1. Ana Fiyat: DAİMA BEYAZ
         styles[1] = 'color: white; font-weight: bold;'
-        
-        # 2. Değişim: Yeşil/Kırmızı
         if ch > 0: styles[2] = 'color: #00ff00; font-weight: bold;'
         elif ch < 0: styles[2] = 'color: #ff4444; font-weight: bold;'
-        
-        # 3. Paribu: Koyu Yeşil
         styles[3] = 'color: #2e7d32; font-weight: bold;'
-        
-        # 4. BtcTurk: Koyu Mavi (#1976D2 veya #1565C0)
-        styles[4] = 'color: #1976d2; font-weight: bold;'
-        
-        # 5. Binance: Sarı / Gold
+        styles[4] = 'color: #1565c0; font-weight: bold;'
         styles[5] = 'color: #ffd700; font-weight: bold;'
-        
         return styles
 
-    # --- SÜTUN AYARLARI ---
     column_config = {
         "Coin": st.column_config.TextColumn("Coin"),
-        "Değişim %": st.column_config.NumberColumn(f"{zaman} Değişim", format="%.2f %%"),
+        "Değişim %": st.column_config.NumberColumn(f"{zaman} Trendi", format="%.2f %%"),
         "Ana Fiyat": st.column_config.TextColumn(f"🔥 {ana_borsa} (Ana)"),
-        
-        # Linklerin Görünümü (#etiket kısmını okuyup fiyatı yazdırıyoruz)
         "Paribu": st.column_config.LinkColumn("Paribu (TL)", display_text=r"#etiket=(.*)"),
         "BtcTurk": st.column_config.LinkColumn("BtcTurk (TL)", display_text=r"#etiket=(.*)"),
         "Binance": st.column_config.LinkColumn("Binance (TL)", display_text=r"#etiket=(.*)"),
@@ -218,9 +249,12 @@ if rows:
         height=800,
         hide_index=True
     )
-    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Fiyatlara tıklayarak borsaya gidebilirsiniz.")
+    
+    # Bilgilendirme notu
+    kaynak_notu = "Binance Global Arşivi" if zaman != "24 Saat" else "Borsa Verisi"
+    st.caption(f"Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Veri Kaynağı: {kaynak_notu}")
 else:
-    st.error("Veri yok.")
+    st.error("Veriler yükleniyor veya API yanıt vermiyor. Lütfen bekleyin...")
 
 time.sleep(YENILEME_HIZI)
 st.rerun()
