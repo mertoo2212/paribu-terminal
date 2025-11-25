@@ -19,6 +19,8 @@ st.markdown("""
     div[data-testid="stDataFrame"] { font-family: 'Consolas', 'Courier New', monospace; font-size: 1.05rem; }
     a { text-decoration: none !important; color: inherit !important; }
     a:hover { text-decoration: underline !important; }
+    /* Grafik başlıklarını ortala */
+    .chart-title { text-align: center; font-weight: bold; margin-bottom: 5px; color: #aaa; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -27,7 +29,6 @@ YENILEME_HIZI = 15
 LIMIT_1S = 240     
 LIMIT_4S = 960     
 
-# --- ANTI-ROBOT BAŞLIKLARI ---
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
@@ -99,23 +100,58 @@ def get_usdt_rates():
     rates["BtcTurk"] = float(r['data'][0]['last']) if r else 0
     return rates
 
+# --- GRAFİK VERİSİ ÇEKME (YENİ ÖZELLİK) ---
+@st.cache_data(ttl=300) # Grafikleri 5 dakikada bir güncelle (Sistemi yormasın)
+def get_chart_data(coin_symbol):
+    charts = {"Paribu": [], "BtcTurk": [], "Binance": []}
+    
+    # 1. Binance (USDT)
+    try:
+        url = f"https://data-api.binance.vision/api/v3/klines?symbol={coin_symbol}USDT&interval=1h&limit=24"
+        r = safe_get(url)
+        if r:
+            # Binance verisi: [time, open, high, low, close...] -> index 4 close
+            charts["Binance"] = [float(x[4]) for x in r]
+    except: pass
+
+    # 2. BtcTurk (TRY)
+    try:
+        end_ts = int(time.time())
+        start_ts = end_ts - (24 * 60 * 60) # Son 24 saat
+        url = f"https://graph-api.btcturk.com/v1/klines/history?symbol={coin_symbol}TRY&resolution=60&from={start_ts}&to={end_ts}"
+        r = safe_get(url)
+        if r and 'c' in r: # 'c' = close prices
+            charts["BtcTurk"] = [float(x) for x in r['c']]
+    except: pass
+
+    # 3. Paribu (TRY)
+    # Paribu Chart API'si bazen header/cookie ister, basitçe deniyoruz.
+    try:
+        url = f"https://www.paribu.com/dapi/v1/chart/{coin_symbol.lower()}_tl"
+        r = safe_get(url)
+        if r:
+            # Paribu verisi: [[timestamp, vol, open, high, low, close], ...]
+            # Son 24 veriyi alalım (yaklaşık)
+            data = r[-24:] 
+            charts["Paribu"] = [float(x[5]) for x in data]
+    except: pass
+
+    return charts
+
 def get_live_data(usdt_rate):
     p_dict, bt_dict, bin_dict = {}, {}, {}
-    
     # Paribu
     r = safe_get("https://www.paribu.com/ticker")
     if r:
         for s, v in r.items():
             if "_TL" in s:
                 p_dict[s.replace("_TL", "")] = {"price": float(v['last']), "change": float(v['percentChange'])}
-    
     # BtcTurk
     r = safe_get("https://api.btcturk.com/api/v2/ticker")
     if r:
         for i in r['data']:
             if i['pair'].endswith("TRY"):
                 bt_dict[i['pair'].replace("TRY", "")] = {"price": float(i['last']), "change": float(i['dailyPercent'])}
-    
     # Binance
     r = safe_get("https://data-api.binance.vision/api/v3/ticker/24hr")
     if r:
@@ -131,19 +167,56 @@ def get_live_data(usdt_rate):
 st.title("💎 Kripto Borsa Terminali")
 
 uptime = havuz.get_uptime()
-st.info(f"📡 **Ortak Veri Havuzu Aktif** | Sunucu Açık Kalma Süresi: **{uptime}** | Mini grafikler toplanan verilerle oluşturulur.")
+st.info(f"📡 **Ortak Veri Havuzu Aktif** | Sunucu Açık Kalma Süresi: **{uptime}**")
 
+# USDT KURLARI
 usdt = get_usdt_rates()
 k1, k2, k3 = st.columns(3)
 k1.metric("Paribu USDT", f"{usdt['Paribu']:.2f} ₺")
 k2.metric("BtcTurk USDT", f"{usdt['BtcTurk']:.2f} ₺")
 k3.metric("Binance USDT", f"{usdt['Binance']:.2f} ₺")
 
+# --- GRAFİK ALANI (YENİ EKLENDİ) ---
+st.markdown("---")
+grafik_col1, grafik_col2 = st.columns([1, 3])
+
+with grafik_col1:
+    # Grafik Seçimi
+    secilen_grafik_coin = st.radio("Grafik Görüntüle:", ["BTC", "ETH"], horizontal=True)
+
+# Grafik Verilerini Çek
+charts = get_chart_data(secilen_grafik_coin)
+
+# 3 Grafiği Yan Yana Koy
+g1, g2, g3 = st.columns(3)
+
+with g1:
+    st.markdown(f"<div class='chart-title'>Paribu ({secilen_grafik_coin}/TL)</div>", unsafe_allow_html=True)
+    if charts["Paribu"]:
+        st.line_chart(charts["Paribu"], height=150)
+    else:
+        st.caption("Veri Alınamadı")
+
+with g2:
+    st.markdown(f"<div class='chart-title'>BtcTurk ({secilen_grafik_coin}/TL)</div>", unsafe_allow_html=True)
+    if charts["BtcTurk"]:
+        st.line_chart(charts["BtcTurk"], height=150)
+    else:
+        st.caption("Veri Alınamadı")
+
+with g3:
+    st.markdown(f"<div class='chart-title'>Binance ({secilen_grafik_coin}/USDT)</div>", unsafe_allow_html=True)
+    if charts["Binance"]:
+        st.line_chart(charts["Binance"], height=150)
+    else:
+        st.caption("Veri Alınamadı")
+
 st.markdown("---")
 
+# --- TABLO ALANI ---
 col_b, col_z = st.columns([1, 1])
-with col_b: ana_borsa = st.radio("BORSA:", ["Paribu", "BtcTurk", "Binance"], horizontal=True)
-with col_z: zaman = st.radio("ZAMAN:", ["1 Saat", "4 Saat", "24 Saat"], horizontal=True)
+with col_b: ana_borsa = st.radio("BORSA LİSTESİ:", ["Paribu", "BtcTurk", "Binance"], horizontal=True)
+with col_z: zaman = st.radio("ZAMAN DİLİMİ:", ["1 Saat", "4 Saat", "24 Saat"], horizontal=True)
 
 p_d, b_d, bin_d = get_live_data(usdt['Binance'])
 
@@ -168,7 +241,7 @@ for c in lst:
         # HAVUZA EKLE
         if ana_fiyat > 0: havuz.veri_ekle(c, ana_fiyat)
 
-        # DEĞİŞİM & GRAFİK VERİSİ
+        # HESAPLAMA
         gosterilecek_degisim = 0.0
         gecmis_liste = havuz.get_gecmis(c)
 
@@ -191,7 +264,7 @@ for c in lst:
             "Coin": c,
             "Ana Fiyat": kesin_format(ana_fiyat),
             "Değişim %": gosterilecek_degisim,
-            "Trend": gecmis_liste, # GRAFİK İÇİN HAM LİSTE
+            "Trend": gecmis_liste,
             "Paribu": make_link(get_paribu_link(c), kesin_format(pf)),
             "BtcTurk": make_link(get_btcturk_link(c), kesin_format(btf)),
             "Binance": make_link(get_binance_link(c), kesin_format(binf))
@@ -212,29 +285,18 @@ if rows:
         styles[6] = 'color: #ffd700; font-weight: bold;'
         return styles
 
-    # --- SÜTUN AYARLARI (GRAFİK EKLENDİ) ---
     column_config = {
         "Coin": st.column_config.TextColumn("Coin"),
         "Değişim %": st.column_config.NumberColumn(f"{zaman} Değişim", format="%.2f %%"),
-        
-        # YENİ: LineChartColumn (Satır İçi Grafik)
-        "Trend": st.column_config.LineChartColumn(
-            "Canlı Grafik (4s)",
-            y_min=0,
-            y_max=None, # Otomatik ölçekleme
-        ),
-
+        "Trend": st.column_config.LineChartColumn("Canlı Grafik (4s)", y_min=0, y_max=None),
         "Ana Fiyat": st.column_config.TextColumn(f"🔥 {ana_borsa} (Ana)"),
         "Paribu": st.column_config.LinkColumn("Paribu (TL)", display_text=r"#etiket=(.*)"),
         "BtcTurk": st.column_config.LinkColumn("BtcTurk (TL)", display_text=r"#etiket=(.*)"),
         "Binance": st.column_config.LinkColumn("Binance (TL)", display_text=r"#etiket=(.*)"),
     }
 
-    # Sıralama: Trend grafiği değişimden hemen sonra gelsin
-    cols = ["Coin", "Ana Fiyat", "Değişim %", "Trend", "Paribu", "BtcTurk", "Binance"]
-
     st.dataframe(
-        df[cols].style.apply(style_row, axis=1),
+        df[["Coin", "Ana Fiyat", "Değişim %", "Trend", "Paribu", "BtcTurk", "Binance"]].style.apply(style_row, axis=1),
         column_config=column_config,
         use_container_width=True,
         height=800,
