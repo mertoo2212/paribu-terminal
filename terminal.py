@@ -6,12 +6,12 @@ from datetime import datetime
 import threading
 import streamlit.components.v1 as components
 
-# --- SAYFA AYARLARI (Performans Modu) ---
+# --- SAYFA AYARLARI ---
 st.set_page_config(
     page_title="Ultra Borsa Terminali vStable",
     page_icon="💎",
     layout="wide",
-    initial_sidebar_state="collapsed" # Kenar çubuğunu kapalı başlat (Hız hissi için)
+    initial_sidebar_state="collapsed"
 )
 
 # --- CSS OPTİMİZASYONU ---
@@ -30,41 +30,38 @@ st.markdown("""
     
     /* Metrik Kutuları */
     div[data-testid="stMetric"] { background-color: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px; }
+    .chart-title { text-align: center; font-size: 0.9rem; font-weight: bold; margin-bottom: 5px; color: #8b949e; }
     </style>
     """, unsafe_allow_html=True)
 
 # --- SABİTLER ---
-LIMIT_4S = 960 # 4 Saatlik veri sınırı
+LIMIT_4S = 960
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
-# --- ARKA PLAN MOTORU (CORE ENGINE) ---
-# Bu sınıf tüm ağır işi yapar. UI sadece buradan okur.
+# --- ARKA PLAN MOTORU ---
 @st.cache_resource
 class DataEngine:
     def __init__(self):
-        self.data = {}          # Coin verileri { 'BTC': [fiyat1, fiyat2...] }
-        self.latest_prices = {} # En son anlık fiyatlar { 'BTC': {'paribu': 0, ...} }
-        self.chat_log = []      # Sohbet mesajları
+        self.data = {}
+        self.latest_prices = {}
+        self.chat_log = []
         self.lock = threading.Lock()
         self.running = True
-        self.session = requests.Session() # Performans için tek oturum (Connection Reuse)
+        self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.start_time = datetime.now()
         
-        # Arka plan işçisini başlat
         self.thread = threading.Thread(target=self._background_worker, daemon=True)
         self.thread.start()
 
     def _safe_get(self, url):
         try:
-            # Timeout süresini kısa tutuyoruz ki sistem takılmasın
             response = self.session.get(url, timeout=4)
             if response.status_code == 200: return response.json()
         except: return None
         return None
 
     def _background_worker(self):
-        """Sürekli çalışan ve veri toplayan görünmez işçi"""
         while self.running:
             try:
                 # 1. Kurlar
@@ -77,10 +74,9 @@ class DataEngine:
                 b_raw = self._safe_get("https://api.btcturk.com/api/v2/ticker")
                 bin_raw = self._safe_get("https://data-api.binance.vision/api/v3/ticker/24hr")
 
-                # 3. Veri İşleme (Hafızada tutulacak geçici sözlük)
                 temp_prices = {}
 
-                # Paribu İşleme
+                # Paribu
                 if p_raw:
                     if "USDT_TL" in p_raw: usdt_rates["Paribu"] = float(p_raw["USDT_TL"]['last'])
                     for s, v in p_raw.items():
@@ -89,7 +85,7 @@ class DataEngine:
                             if coin not in temp_prices: temp_prices[coin] = {}
                             temp_prices[coin]['paribu'] = {"price": float(v['last']), "change": float(v['percentChange'])}
 
-                # BtcTurk İşleme
+                # BtcTurk
                 if b_raw:
                     for i in b_raw.get('data', []):
                         if i['pair'] == "USDTTRY": usdt_rates["BtcTurk"] = float(i['last'])
@@ -98,26 +94,23 @@ class DataEngine:
                             if coin not in temp_prices: temp_prices[coin] = {}
                             temp_prices[coin]['btcturk'] = {"price": float(i['last']), "change": float(i['dailyPercent'])}
 
-                # Binance İşleme
+                # Binance
                 if bin_raw:
                     active_usdt = usdt_rates["Binance"]
                     for i in bin_raw:
                         if i['symbol'].endswith("USDT"):
                             coin = i['symbol'].replace("USDT", "")
-                            if coin in temp_prices: # Sadece TR borsalarında olanları al (RAM Tasarrufu)
+                            if coin in temp_prices:
                                 temp_prices[coin]['binance'] = {
                                     "price": float(i['lastPrice']) * active_usdt,
                                     "change": float(i['priceChangePercent'])
                                 }
 
-                # 4. Ana Hafızayı Güncelle (Kilitle ve Yaz)
                 with self.lock:
                     self.latest_prices = temp_prices
                     self.usdt_rates = usdt_rates
                     
-                    # Tarihçe Kaydı
                     for coin, markets in temp_prices.items():
-                        # Ana fiyat belirleme önceliği: Paribu -> BtcTurk -> Binance
                         price = 0
                         if 'paribu' in markets: price = markets['paribu']['price']
                         elif 'btcturk' in markets: price = markets['btcturk']['price']
@@ -126,17 +119,14 @@ class DataEngine:
                         if price > 0:
                             if coin not in self.data: self.data[coin] = []
                             self.data[coin].append(price)
-                            # Liste sınırla
                             if len(self.data[coin]) > LIMIT_4S + 20:
                                 self.data[coin] = self.data[coin][-(LIMIT_4S + 20):]
 
             except Exception as e:
-                print(f"Arka plan hatası: {e}")
+                print(f"Hata: {e}")
             
-            # 15 Saniye Bekle
             time.sleep(15)
 
-    # --- OKUMA FONKSİYONLARI (UI İçin) ---
     def get_snapshot(self):
         with self.lock:
             return self.latest_prices.copy(), getattr(self, 'usdt_rates', {}), self.data.copy()
@@ -153,7 +143,6 @@ class DataEngine:
     def get_uptime(self):
         return str(datetime.now() - self.start_time).split('.')[0]
 
-# Motoru Başlat (Singleton)
 engine = DataEngine()
 
 # --- FORMATLAMA ---
@@ -163,17 +152,16 @@ def fmt_price(val):
     if val < 10: return f"{val:.6f} ₺"
     return f"{val:.2f} ₺"
 
-def get_link(base, price_str):
-    if price_str == "-": return None
+# HATA DÜZELTİLDİ: make_link olarak isimlendirildi
+def make_link(base, price_str):
+    if price_str == "-" or price_str is None: return None
     return f"{base}#etiket={price_str.replace(' ', '_')}"
 
-# --- ARAYÜZ BAŞLANGICI ---
+# --- ARAYÜZ ---
 st.title("💎 Ultra Borsa Terminali")
 
-# Veriyi Motordan Al (Anlık ve Hızlı)
 prices, usdt, history = engine.get_snapshot()
 
-# Üst Bilgi
 if usdt:
     c1, c2, c3, c4 = st.columns(4)
     c1.info(f"📡 **Uptime:** {engine.get_uptime()}")
@@ -181,16 +169,14 @@ if usdt:
     c3.metric("BtcTurk USDT", f"{usdt.get('BtcTurk', 0):.2f} ₺")
     c4.metric("Binance USDT", f"{usdt.get('Binance', 34.5):.2f} ₺")
 else:
-    st.warning("Motor ısınıyor... Veriler birazdan gelecek.")
+    st.warning("Veri motoru başlatılıyor... Lütfen bekleyin.")
 
 st.markdown("---")
 
-# --- GRAFİK & CHAT ALANI ---
 col_main, col_side = st.columns([3, 1])
 
 with col_side:
     st.subheader("💬 Sohbet")
-    # Mesajları Göster
     msgs = engine.get_messages()
     chat_html = "<div class='chat-box'>"
     for m in reversed(msgs):
@@ -198,7 +184,6 @@ with col_side:
     chat_html += "</div>"
     st.markdown(chat_html, unsafe_allow_html=True)
     
-    # Mesaj Yaz
     with st.form("chat_form", clear_on_submit=True):
         u_name = st.text_input("İsim", "Anonim", label_visibility="collapsed", placeholder="İsim")
         u_msg = st.text_input("Mesaj", label_visibility="collapsed", placeholder="Mesaj yaz...")
@@ -212,7 +197,6 @@ with col_side:
 
 with col_main:
     tv_coin = st.text_input("Grafik Sembolü:", "BTC").upper()
-    # TradingView Widget
     html_code = f"""
     <div class="tradingview-widget-container">
       <div id="tradingview_chart"></div>
@@ -231,27 +215,22 @@ with col_main:
 
 st.markdown("---")
 
-# --- TABLO KONTROLLERİ ---
 c1, c2, c3 = st.columns([2, 2, 4])
 with c1: ana_borsa = st.radio("Borsa:", ["Paribu", "BtcTurk", "Binance"], horizontal=True)
 with c2: zaman = st.radio("Zaman:", ["1 Saat", "4 Saat", "24 Saat"], horizontal=True)
 with c3: arama = st.text_input("Filtrele", placeholder="Coin ara (Örn: AVAX)", label_visibility="collapsed").upper()
 
-# --- TABLO OLUŞTURMA ---
 rows = []
 alarm_coins = []
-
-# Coin Listesini Belirle (Prices doluysa)
 coin_list = sorted(prices.keys()) if prices else []
 
 for c in coin_list:
-    if arama and arama not in c: continue # Arama Filtresi
+    if arama and arama not in c: continue
 
     p_data = prices[c].get('paribu', {})
     bt_data = prices[c].get('btcturk', {})
     bin_data = prices[c].get('binance', {})
 
-    # Ana Fiyat ve Değişim Seçimi
     main_price = 0
     disp_change = 0.0
     
@@ -265,28 +244,22 @@ for c in coin_list:
         main_price = bin_data.get('price', 0)
         disp_change = bin_data.get('change', 0)
 
-    # Zaman Dilimi Hesaplaması
+    chart_data = []
     if c in history and len(history[c]) > 0:
         hist = history[c]
         limit = 240 if zaman == "1 Saat" else 960
         
         if zaman != "24 Saat":
             idx = -limit if len(hist) >= limit else 0
-            # Eğer hafızada veri varsa hesapla, yoksa 0
             if len(hist) > 0 and hist[idx] > 0:
                 disp_change = ((main_price - hist[idx]) / hist[idx]) * 100
-            
-            # Grafik verisi (Son X saat)
             chart_data = hist[idx:]
         else:
-            chart_data = hist # 24 saatte tüm biriken veriyi göster
-    else:
-        chart_data = []
+            chart_data = hist
 
-    # Alarm Kontrolü
     if abs(disp_change) >= alarm_val: alarm_coins.append(c)
 
-    # Satır Ekle
+    # LİNKLERDEKİ İSİM HATASI DÜZELTİLDİ (make_link kullanıldı)
     rows.append({
         "Coin": c,
         "Ana Fiyat": fmt_price(main_price),
@@ -297,11 +270,9 @@ for c in coin_list:
         "Binance": make_link(f"https://www.binance.com/en-TR/trade/{c}_USDT", fmt_price(bin_data.get('price', 0)))
     })
 
-# Tabloyu Çiz
 if rows:
     df = pd.DataFrame(rows).sort_values(by="Değişim %", ascending=False)
     
-    # Stil Fonksiyonu
     def style_row(row):
         s = [''] * len(row)
         ch = row["Değişim %"]
@@ -330,8 +301,7 @@ if rows:
     if alarm_coins:
         st.toast(f"🚨 Hareketli Coinler: {', '.join(alarm_coins[:5])}", icon="🔥")
 else:
-    st.info("Veri motoru çalışıyor, lütfen bekleyin...")
+    st.info("Veriler hazırlanıyor, lütfen bekleyin...")
 
-# UI Yenileme (Veri çekmekten bağımsız, sadece okuma yapar)
 time.sleep(1) 
 st.rerun()
