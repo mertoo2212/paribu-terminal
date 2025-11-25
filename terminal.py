@@ -5,16 +5,17 @@ import time
 from datetime import datetime
 import threading
 import streamlit.components.v1 as components
+import collections
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(
-    page_title="Ultra Borsa Terminali vPro",
+    page_title="Ultra Borsa Terminali vUltimate",
     page_icon="💎",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- CSS ---
+# --- CSS (Görünüm) ---
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; color: #fafafa; }
@@ -22,91 +23,119 @@ st.markdown("""
     a { text-decoration: none !important; color: inherit !important; transition: all 0.2s; }
     a:hover { text-decoration: underline !important; color: #4CAF50 !important; }
     
-    /* Panel Stilleri */
-    .admin-card { background-color: #21262d; padding: 15px; border-radius: 10px; border-left: 4px solid #58a6ff; margin-bottom: 10px; }
-    .success-stat { color: #4CAF50; font-weight: bold; font-size: 1.2rem; }
-    .chart-title { text-align: center; font-size: 0.9rem; font-weight: bold; margin-bottom: 5px; color: #8b949e; }
+    /* Panel Kartları */
+    .stat-card { background-color: #161b22; padding: 15px; border-radius: 8px; border: 1px solid #30363d; text-align: center; }
+    .stat-value { font-size: 24px; font-weight: bold; color: #58a6ff; }
+    .stat-label { font-size: 12px; color: #8b949e; }
+    
+    /* Sohbet */
+    .chat-box { height: 300px; overflow-y: auto; background-color: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px; font-size: 0.9rem; }
+    .chat-msg { margin-bottom: 5px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+    .chat-user { font-weight: bold; color: #79c0ff; }
+    .chat-time { font-size: 0.7rem; color: #8b949e; margin-right: 5px; }
     </style>
     """, unsafe_allow_html=True)
 
 # --- SABİTLER ---
-LIMIT_4S = 960
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
-# --- MOTOR VE HAFIZA ---
+# --- MOTOR (Backend) ---
 @st.cache_resource
 class DataEngine:
     def __init__(self):
-        self.data = {}
+        self.data = {} 
         self.latest_prices = {}
+        self.chat_log = []
         self.lock = threading.Lock()
         self.running = True
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.start_time = datetime.now()
         
-        # --- YENİ: ALARM AYARLARI ---
-        self.alarm_rules = {
-            "percentage": 5.0,        # Varsayılan %5
-            "ignored_coins": ["USDT", "USDC", "BUSD"], # Görmezden gelinecekler
-            "price_targets": {}       # { 'BTC': 100000 } gibi hedef fiyatlar
+        # --- GELİŞMİŞ AYARLAR (Admin Kontrollü) ---
+        self.config = {
+            "active_exchanges": {"Paribu": True, "BtcTurk": True, "Binance": True}, # Borsaları Aç/Kapa
+            "alarm_percent": 5.0,
+            "arbitrage_percent": 3.0, # Arbitraj Alarmı
+            "ignored_coins": ["USDT", "USDC", "BUSD", "TRY"],
+            "refresh_rate": 15
         }
+        
+        # Performans Metrikleri
+        self.latency = {"Paribu": 0, "BtcTurk": 0, "Binance": 0}
         
         self.thread = threading.Thread(target=self._background_worker, daemon=True)
         self.thread.start()
 
-    def _safe_get(self, url):
+    def _safe_get(self, url, source_name):
+        start = time.time()
         try:
-            response = self.session.get(url, timeout=4)
+            response = self.session.get(url, timeout=5)
+            # Gecikme süresini kaydet (Latency Monitor)
+            self.latency[source_name] = round((time.time() - start) * 1000) # ms cinsinden
+            
             if response.status_code == 200: return response.json()
-        except: return None
+        except: 
+            self.latency[source_name] = -1 # Hata kodu
+            return None
         return None
 
     def _background_worker(self):
         while self.running:
             try:
-                usdt_rates = {"Binance": 34.50, "Paribu": 0, "BtcTurk": 0}
-                r = self._safe_get("https://data-api.binance.vision/api/v3/ticker/price?symbol=USDTTRY")
-                if r: usdt_rates["Binance"] = float(r['price'])
+                # 1. Aktiflik Kontrolü (Admin borsayı kapattıysa veri çekme)
+                active_ex = self.config["active_exchanges"]
                 
-                p_raw = self._safe_get("https://www.paribu.com/ticker")
-                b_raw = self._safe_get("https://api.btcturk.com/api/v2/ticker")
-                bin_raw = self._safe_get("https://data-api.binance.vision/api/v3/ticker/24hr")
+                usdt_rates = {"Binance": 34.50, "Paribu": 0, "BtcTurk": 0}
+                # Kurları her zaman çekmeye çalış (Referans için)
+                r = self._safe_get("https://data-api.binance.vision/api/v3/ticker/price?symbol=USDTTRY", "Binance")
+                if r: usdt_rates["Binance"] = float(r['price'])
 
                 temp_prices = {}
 
-                if p_raw:
-                    if "USDT_TL" in p_raw: usdt_rates["Paribu"] = float(p_raw["USDT_TL"]['last'])
-                    for s, v in p_raw.items():
-                        if "_TL" in s:
-                            coin = s.replace("_TL", "")
-                            if coin not in temp_prices: temp_prices[coin] = {}
-                            temp_prices[coin]['paribu'] = {"price": float(v['last']), "change": float(v['percentChange'])}
+                # --- PARIBU ---
+                if active_ex["Paribu"]:
+                    p_raw = self._safe_get("https://www.paribu.com/ticker", "Paribu")
+                    if p_raw:
+                        if "USDT_TL" in p_raw: usdt_rates["Paribu"] = float(p_raw["USDT_TL"]['last'])
+                        for s, v in p_raw.items():
+                            if "_TL" in s:
+                                c = s.replace("_TL", "")
+                                if c not in temp_prices: temp_prices[c] = {}
+                                temp_prices[c]['paribu'] = {"price": float(v['last']), "change": float(v['percentChange'])}
 
-                if b_raw:
-                    for i in b_raw.get('data', []):
-                        if i['pair'] == "USDTTRY": usdt_rates["BtcTurk"] = float(i['last'])
-                        if i['pair'].endswith("TRY"):
-                            coin = i['pair'].replace("TRY", "")
-                            if coin not in temp_prices: temp_prices[coin] = {}
-                            temp_prices[coin]['btcturk'] = {"price": float(i['last']), "change": float(i['dailyPercent'])}
+                # --- BTCTURK ---
+                if active_ex["BtcTurk"]:
+                    b_raw = self._safe_get("https://api.btcturk.com/api/v2/ticker", "BtcTurk")
+                    if b_raw:
+                        for i in b_raw.get('data', []):
+                            if i['pair'] == "USDTTRY": usdt_rates["BtcTurk"] = float(i['last'])
+                            if i['pair'].endswith("TRY"):
+                                c = i['pair'].replace("TRY", "")
+                                if c not in temp_prices: temp_prices[c] = {}
+                                temp_prices[c]['btcturk'] = {"price": float(i['last']), "change": float(i['dailyPercent'])}
 
-                if bin_raw:
-                    active_usdt = usdt_rates["Binance"]
-                    for i in bin_raw:
-                        if i['symbol'].endswith("USDT"):
-                            coin = i['symbol'].replace("USDT", "")
-                            if coin in temp_prices:
-                                temp_prices[coin]['binance'] = {
-                                    "price": float(i['lastPrice']) * active_usdt,
-                                    "change": float(i['priceChangePercent'])
-                                }
+                # --- BINANCE ---
+                if active_ex["Binance"]:
+                    bin_raw = self._safe_get("https://data-api.binance.vision/api/v3/ticker/24hr", "Binance")
+                    if bin_raw:
+                        active_usdt = usdt_rates["Binance"]
+                        for i in bin_raw:
+                            if i['symbol'].endswith("USDT"):
+                                c = i['symbol'].replace("USDT", "")
+                                if c in temp_prices: # Sadece listede olanları al
+                                    temp_prices[c]['binance'] = {
+                                        "price": float(i['lastPrice']) * active_usdt,
+                                        "change": float(i['priceChangePercent'])
+                                    }
 
+                # --- VERİTABANI GÜNCELLEME ---
                 with self.lock:
                     self.latest_prices = temp_prices
                     self.usdt_rates = usdt_rates
                     
                     for coin, markets in temp_prices.items():
+                        # Fiyat önceliği: Paribu -> BtcTurk -> Binance
                         price = 0
                         if 'paribu' in markets: price = markets['paribu']['price']
                         elif 'btcturk' in markets: price = markets['btcturk']['price']
@@ -115,29 +144,43 @@ class DataEngine:
                         if price > 0:
                             if coin not in self.data: self.data[coin] = []
                             self.data[coin].append(price)
-                            if len(self.data[coin]) > LIMIT_4S + 20:
-                                self.data[coin] = self.data[coin][-(LIMIT_4S + 20):]
+                            # 4 Saatlik veri tut (15sn * 4 * 60 * 4 = ~960)
+                            if len(self.data[coin]) > 1000:
+                                self.data[coin] = self.data[coin][-1000:]
 
-            except Exception as e: print(f"Hata: {e}")
-            time.sleep(15)
+            except Exception as e: print(f"Core Error: {e}")
+            
+            # Dinamik Hız (Admin panelinden ayarlanabilir)
+            time.sleep(self.config["refresh_rate"])
 
+    # --- API FONKSİYONLARI ---
     def get_snapshot(self):
         with self.lock:
             return self.latest_prices.copy(), getattr(self, 'usdt_rates', {}), self.data.copy()
 
+    def add_message(self, user, msg):
+        with self.lock:
+            t = datetime.now().strftime("%H:%M")
+            self.chat_log.append({"time": t, "user": user, "msg": msg})
+            if len(self.chat_log) > 100: self.chat_log.pop(0) # Son 100 mesaj
+    
+    def clear_chat(self):
+        with self.lock: self.chat_log = []
+
+    def reset_memory(self):
+        with self.lock: self.data = {}
+
+    def get_config(self):
+        return self.config
+    
+    def update_config(self, key, value):
+        with self.lock: self.config[key] = value
+
+    def get_latency(self):
+        return self.latency
+
     def get_uptime(self):
         return str(datetime.now() - self.start_time).split('.')[0]
-
-    # --- ALARM YÖNETİMİ ---
-    def update_alarm_rules(self, percentage, ignored_list, targets):
-        with self.lock:
-            self.alarm_rules["percentage"] = percentage
-            self.alarm_rules["ignored_coins"] = ignored_list
-            self.alarm_rules["price_targets"] = targets
-
-    def get_alarm_rules(self):
-        with self.lock:
-            return self.alarm_rules.copy()
 
 engine = DataEngine()
 
@@ -152,18 +195,18 @@ def make_link(base, price_str):
     if price_str == "-" or price_str is None: return None
     return f"{base}#etiket={price_str.replace(' ', '_')}"
 
-# --- ARAYÜZ ---
+# --- ARAYÜZ BAŞLANGICI ---
 st.title("💎 Ultra Borsa Terminali")
 
-# Yan Menü: Navigasyon
-page = st.sidebar.radio("Menü", ["📊 Terminal", "🛠️ Kontrol Paneli"])
+# Yan Menü
+page = st.sidebar.radio("Menü", ["📊 Terminal", "🛠️ Admin Paneli"])
 
 prices, usdt, history = engine.get_snapshot()
-alarm_config = engine.get_alarm_rules()
+config = engine.get_config()
 
-# -------------------------
-# SAYFA 1: TERMİNAL (ANA EKRAN)
-# -------------------------
+# ==================================================
+# SAYFA: TERMİNAL
+# ==================================================
 if page == "📊 Terminal":
     
     # Üst Bilgi
@@ -174,21 +217,38 @@ if page == "📊 Terminal":
         c3.metric("BtcTurk USDT", f"{usdt.get('BtcTurk', 0):.2f} ₺")
         c4.metric("Binance USDT", f"{usdt.get('Binance', 34.5):.2f} ₺")
     else:
-        st.warning("Motor başlatılıyor...")
+        st.warning("Veri bekleniyor...")
 
     st.markdown("---")
 
-    # Grafik
-    col_main, col_side = st.columns([3, 1])
-    with col_main:
-        tv_coin = st.text_input("Grafik Sembolü:", "BTC").upper()
+    # Grafik ve Sohbet Alanı
+    col_grafik, col_sohbet = st.columns([3, 1])
+
+    with col_sohbet:
+        st.subheader("💬 Sohbet")
+        msgs = engine.get_messages()
+        chat_html = "<div class='chat-box'>"
+        for m in reversed(msgs):
+            chat_html += f"<div class='chat-msg'><span class='chat-time'>{m['time']}</span> <span class='chat-user'>{m['user']}:</span> {m['msg']}</div>"
+        chat_html += "</div>"
+        st.markdown(chat_html, unsafe_allow_html=True)
+        
+        with st.form("chat_form", clear_on_submit=True):
+            u_name = st.text_input("İsim", "Anonim", label_visibility="collapsed", placeholder="İsim")
+            u_msg = st.text_input("Mesaj", label_visibility="collapsed", placeholder="Mesaj...")
+            if st.form_submit_button("Gönder"):
+                if u_msg: engine.add_message(u_name, u_msg)
+                st.rerun()
+
+    with col_grafik:
+        tv_coin = st.text_input("Grafik (Sembol):", "BTC").upper()
         html_code = f"""
         <div class="tradingview-widget-container">
           <div id="tradingview_chart"></div>
           <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
           <script type="text/javascript">
           new TradingView.widget({{
-            "width": "100%", "height": 400, "symbol": "BINANCE:{tv_coin}USDT",
+            "width": "100%", "height": 430, "symbol": "BINANCE:{tv_coin}USDT",
             "interval": "60", "timezone": "Etc/UTC", "theme": "dark", "style": "1",
             "locale": "tr", "enable_publishing": false, "allow_symbol_change": true,
             "container_id": "tradingview_chart"
@@ -196,81 +256,42 @@ if page == "📊 Terminal":
           </script>
         </div>
         """
-        components.html(html_code, height=410)
-    
-    with col_side:
-        st.markdown("### 🔥 Aktif Alarmlar")
-        # Alarm Kontrolü ve Listeleme
-        active_alarms = []
-        limit_pct = alarm_config["percentage"]
-        ignored = alarm_config["ignored_coins"]
-        targets = alarm_config["price_targets"]
-
-        for c, data in prices.items():
-            if c in ignored: continue
-            
-            # Fiyatı al (Paribu öncelikli)
-            p_p = data.get('paribu', {}).get('price', 0)
-            price = p_p if p_p > 0 else data.get('binance', {}).get('price', 0)
-            
-            if price == 0: continue
-
-            # 1. Yüzde Kontrolü
-            if c in history and len(history[c]) > 0:
-                # Son 1 saati kontrol et
-                idx = -240 if len(history[c]) >= 240 else 0
-                if history[c][idx] > 0:
-                    change = ((price - history[c][idx]) / history[c][idx]) * 100
-                    if abs(change) >= limit_pct:
-                        icon = "🚀" if change > 0 else "🔻"
-                        active_alarms.append(f"{icon} **{c}**: %{change:.2f}")
-
-            # 2. Fiyat Hedefi Kontrolü
-            if c in targets:
-                target_p = targets[c]
-                if price >= target_p:
-                    active_alarms.append(f"🎯 **{c}** Hedefi Geçti: {fmt_price(price)}")
-
-        if active_alarms:
-            for alarm in active_alarms[:5]: # Max 5 alarm göster
-                st.error(alarm)
-        else:
-            st.success("Şu an kritik bir hareket yok.")
-            st.caption(f"Alarm Limiti: %{limit_pct}")
+        components.html(html_code, height=440)
 
     st.markdown("---")
 
-    # Tablo Kontrolleri
-    c1, c2, c3 = st.columns([2, 2, 4])
-    with c1: ana_borsa = st.radio("Borsa:", ["Paribu", "BtcTurk", "Binance"], horizontal=True)
+    # Tablo Filtreleri
+    c1, c2, c3 = st.columns([2, 2, 3])
+    with c1: ana_borsa = st.radio("Ana Borsa:", ["Paribu", "BtcTurk", "Binance"], horizontal=True)
     with c2: zaman = st.radio("Zaman:", ["1 Saat", "4 Saat", "24 Saat"], horizontal=True)
     with c3: arama = st.text_input("Filtrele", placeholder="Coin ara...", label_visibility="collapsed").upper()
 
-    # Tablo Oluşturma
     rows = []
+    alarm_list = []
+    arbitraj_list = []
+    
     coin_list = sorted(prices.keys()) if prices else []
 
     for c in coin_list:
+        if c in config["ignored_coins"]: continue
         if arama and arama not in c: continue
 
         p_data = prices[c].get('paribu', {})
         bt_data = prices[c].get('btcturk', {})
         bin_data = prices[c].get('binance', {})
 
+        # Fiyat Seçimi
         main_price, disp_change = 0, 0.0
-        
         if ana_borsa == "Paribu":
-            main_price = p_data.get('price', 0)
-            disp_change = p_data.get('change', 0)
+            main_price, disp_change = p_data.get('price', 0), p_data.get('change', 0)
         elif ana_borsa == "BtcTurk":
-            main_price = bt_data.get('price', 0)
-            disp_change = bt_data.get('change', 0)
+            main_price, disp_change = bt_data.get('price', 0), bt_data.get('change', 0)
         else:
-            main_price = bin_data.get('price', 0)
-            disp_change = bin_data.get('change', 0)
+            main_price, disp_change = bin_data.get('price', 0), bin_data.get('change', 0)
 
+        # Grafik Verisi
         chart_data = []
-        if c in history and len(history[c]) > 0:
+        if c in history:
             hist = history[c]
             if zaman != "24 Saat":
                 limit = 240 if zaman == "1 Saat" else 960
@@ -281,16 +302,32 @@ if page == "📊 Terminal":
             else:
                 chart_data = hist
 
+        # --- ALARM KONTROLLERİ ---
+        
+        # 1. Değişim Alarmı
+        if abs(disp_change) >= config["alarm_percent"]:
+            alarm_list.append(f"{c}: %{disp_change:.2f}")
+
+        # 2. Arbitraj Alarmı (Paribu vs Binance)
+        p_pr = p_data.get('price', 0)
+        b_pr = bin_data.get('price', 0)
+        if p_pr > 0 and b_pr > 0:
+            diff = abs(p_pr - b_pr)
+            diff_pct = (diff / b_pr) * 100
+            if diff_pct > config["arbitrage_percent"]:
+                arbitraj_list.append(f"{c} (Fark: %{diff_pct:.1f})")
+
         rows.append({
             "Coin": c,
             "Ana Fiyat": fmt_price(main_price),
             "Değişim %": disp_change,
             "Trend": chart_data,
-            "Paribu": make_link(f"https://www.paribu.com/markets/{c.lower()}_tl", fmt_price(p_data.get('price', 0))),
+            "Paribu": make_link(f"https://www.paribu.com/markets/{c.lower()}_tl", fmt_price(p_pr)),
             "BtcTurk": make_link(f"https://kripto.btcturk.com/pro/al-sat/{c}_TRY", fmt_price(bt_data.get('price', 0))),
-            "Binance": make_link(f"https://www.binance.com/en-TR/trade/{c}_USDT", fmt_price(bin_data.get('price', 0)))
+            "Binance": make_link(f"https://www.binance.com/en-TR/trade/{c}_USDT", fmt_price(b_pr))
         })
 
+    # Tablo Gösterimi
     if rows:
         df = pd.DataFrame(rows).sort_values(by="Değişim %", ascending=False)
         
@@ -318,70 +355,83 @@ if page == "📊 Terminal":
             },
             use_container_width=True, height=800, hide_index=True
         )
-    
-    time.sleep(1)
-    st.rerun()
+        
+        # BİLDİRİMLER
+        if alarm_list:
+            st.toast(f"🚀 Yüksek Volatilite: {', '.join(alarm_list[:3])}", icon="⚠️")
+        if arbitraj_list:
+            st.toast(f"💸 Arbitraj Fırsatı: {', '.join(arbitraj_list[:3])}", icon="💰")
 
-# -------------------------
-# SAYFA 2: KONTROL PANELİ (YENİ)
-# -------------------------
-elif page == "🛠️ Kontrol Paneli":
-    st.header("🛠️ Sistem ve Alarm Kontrol Merkezi")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("### ⚙️ Genel Alarm Ayarları")
-        st.markdown("""<div class='admin-card'>Buradan genel hassasiyeti ayarlayabilirsin.</div>""", unsafe_allow_html=True)
-        
-        new_pct = st.slider("Genel Tetikleme Yüzdesi (%)", 1.0, 50.0, alarm_config["percentage"])
-        
-        st.write("---")
-        st.markdown("### 🔇 Sessize Alınan Coinler")
-        # Mevcut listeyi string olarak al
-        current_ignored = ", ".join(alarm_config["ignored_coins"])
-        ignored_input = st.text_area("Virgülle ayırarak yaz (Örn: USDT, BUSD)", current_ignored)
-        
-        # Listeye çevir
-        new_ignored = [x.strip().upper() for x in ignored_input.split(",") if x.strip()]
+    else:
+        st.info("Veriler yükleniyor...")
 
-    with col2:
-        st.markdown("### 🎯 Özel Fiyat Hedefleri")
-        st.caption("Coin belirli bir fiyata gelince haber verir.")
+# ==================================================
+# SAYFA: ADMIN PANELİ
+# ==================================================
+elif page == "🛠️ Admin Paneli":
+    st.title("🛠️ Yönetim Merkezi")
+    
+    # SEKME 1: SİSTEM SAĞLIĞI
+    tab1, tab2, tab3 = st.tabs(["📡 Sistem Sağlığı", "⚙️ Genel Ayarlar", "🧨 Acil Durum"])
+    
+    with tab1:
+        lat = engine.get_latency()
+        c1, c2, c3 = st.columns(3)
         
-        # Hedef Ekleme Formu
-        with st.form("target_add"):
-            t_coin = st.text_input("Coin Sembolü (Örn: BTC)").upper()
-            t_price = st.number_input("Hedef Fiyat (TL)", min_value=0.0, step=0.1)
-            add_btn = st.form_submit_button("Hedef Ekle")
+        def metric_card(label, val, suffix="ms"):
+            color = "green" if val < 500 and val != -1 else "orange" if val < 1000 else "red"
+            status = f"{val} {suffix}" if val != -1 else "Çevrimdışı"
+            st.markdown(f"""
+            <div class="stat-card" style="border-left: 4px solid {color};">
+                <div class="stat-label">{label}</div>
+                <div class="stat-value">{status}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c1: metric_card("Paribu Gecikmesi", lat["Paribu"])
+        with c2: metric_card("BtcTurk Gecikmesi", lat["BtcTurk"])
+        with c3: metric_card("Binance Gecikmesi", lat["Binance"])
+        
+        st.write("")
+        st.info(f"Not: Gecikme süresi (Latency), borsa sunucusunun yanıt verme hızıdır. Düşük olması iyidir. -1 ise bağlantı yok demektir.")
+
+    with tab2:
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            st.subheader("🚨 Alarm Hassasiyeti")
+            new_pct = st.slider("Fiyat Değişim Alarmı (%)", 1.0, 20.0, config["alarm_percent"])
+            new_arb = st.slider("Arbitraj Fark Alarmı (%)", 1.0, 10.0, config["arbitrage_percent"])
             
-            if add_btn and t_coin and t_price > 0:
-                alarm_config["price_targets"][t_coin] = t_price
-                st.success(f"{t_coin} için {t_price} TL hedefi eklendi!")
+            if st.button("Alarm Ayarlarını Kaydet"):
+                engine.update_config("alarm_percent", new_pct)
+                engine.update_config("arbitrage_percent", new_arb)
+                st.success("Ayarlar güncellendi!")
 
-        # Mevcut Hedefleri Göster ve Sil
-        st.write("#### Aktif Hedefler")
-        targets_to_remove = []
-        for c, p in alarm_config["price_targets"].items():
-            c1, c2 = st.columns([3, 1])
-            c1.info(f"**{c}** -> {p} TL")
-            if c2.button("Sil", key=f"del_{c}"):
-                targets_to_remove.append(c)
+        with c2:
+            st.subheader("🔌 Borsa Bağlantıları")
+            st.caption("Bir borsa çökerse veya yavaşlarsa buradan kapatabilirsin.")
+            
+            p_active = st.toggle("Paribu Verisi", value=config["active_exchanges"]["Paribu"])
+            bt_active = st.toggle("BtcTurk Verisi", value=config["active_exchanges"]["BtcTurk"])
+            bin_active = st.toggle("Binance Verisi", value=config["active_exchanges"]["Binance"])
+            
+            if st.button("Bağlantı Durumunu Güncelle"):
+                new_status = {"Paribu": p_active, "BtcTurk": bt_active, "Binance": bin_active}
+                engine.update_config("active_exchanges", new_status)
+                st.success("Bağlantı ayarları güncellendi!")
+
+    with tab3:
+        st.error("Bu alan verileri sıfırlar. Sadece sistem bozulursa kullanın.")
+        c1, c2 = st.columns(2)
+        if c1.button("🧹 Sohbet Geçmişini Temizle"):
+            engine.clear_chat()
+            st.success("Sohbet temizlendi.")
         
-        # Silme işlemini uygula
-        for c in targets_to_remove:
-            del alarm_config["price_targets"][c]
-            st.rerun()
+        if c2.button("⚠️ Tüm Hafızayı Sıfırla (Reset)"):
+            engine.reset_memory()
+            st.warning("Tüm hafıza silindi ve yeniden başlatıldı.")
 
-    # AYARLARI KAYDET
-    if st.button("💾 Ayarları Kaydet ve Uygula", type="primary"):
-        engine.update_alarm_rules(new_pct, new_ignored, alarm_config["price_targets"])
-        st.toast("Ayarlar başarıyla güncellendi!", icon="✅")
-
-    st.markdown("---")
-    st.markdown("### 📡 Sistem Durumu")
-    st.json({
-        "Uptime": engine.get_uptime(),
-        "Takip Edilen Coin Sayısı": len(prices),
-        "Hafıza Kullanımı (Coin Başına Kayıt)": {k: len(v) for k, v in list(history.items())[:5]} # Örnek ilk 5
-    })
+# Yenileme
+time.sleep(1) 
+st.rerun()
